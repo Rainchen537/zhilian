@@ -226,7 +226,11 @@ json_get() {
   if has_cmd jq; then
     jq -r "$expr"
   elif has_cmd python3; then
-    python3 -c 'import sys,json; data=json.load(sys.stdin); expr=sys.argv[1]
+    python3 -c 'import sys,json
+
+data=json.load(sys.stdin)
+expr=sys.argv[1]
+
 def get(obj, expr):
     cur=obj
     for part in expr.split("."):
@@ -243,6 +247,7 @@ def get(obj, expr):
                 cur = cur[part]
                 break
     return cur
+
 v=get(data, expr)
 if isinstance(v, bool):
     print(str(v).lower())
@@ -529,51 +534,133 @@ ali_api() {
 }
 
 ali_get_record() {
-  local subdomain
-  subdomain=$(full_record_name)
-  ali_api "Action=DescribeSubDomainRecords
-SubDomain=${subdomain}
-Type=${RECORD_TYPE}"
+  ali_api "Action=DescribeDomainRecords
+DomainName=${ZONE}
+RRKeyWord=${RR}
+TypeKeyWord=${RECORD_TYPE}
+PageSize=100"
+}
+
+ali_exact_records_tsv() {
+  local body="$1"
+  if has_cmd jq; then
+    jq -r --arg rr "$RR" --arg type "$RECORD_TYPE" '
+      (.DomainRecords.Record // [])
+      | if type == "array" then . else [.] end
+      | map(select((.RR // "") == $rr and (.Type // "") == $type))
+      | .[]
+      | [(.RecordId // ""), (.Value // "")] | @tsv
+    ' <<<"$body"
+  elif has_cmd python3; then
+    python3 -c 'import json,sys
+rr=sys.argv[1]
+rtype=sys.argv[2]
+data=json.load(sys.stdin)
+records=data.get("DomainRecords", {}).get("Record", []) or []
+if isinstance(records, dict):
+    records=[records]
+for record in records:
+    if str(record.get("RR", "")) == rr and str(record.get("Type", "")) == rtype:
+        rid="" if record.get("RecordId") is None else str(record.get("RecordId"))
+        val="" if record.get("Value") is None else str(record.get("Value"))
+        print(f"{rid}\t{val}")
+' "$RR" "$RECORD_TYPE" <<<"$body"
+  else
+    return 1
+  fi
+}
+
+ali_delete_record() {
+  local record_id="$1"
+  local body
+  body=$(ali_api "Action=DeleteDomainRecord
+RecordId=${record_id}") || return 1
+  grep -q '"RecordId"' <<<"$body"
+}
+
+ali_cleanup_duplicate_lines() {
+  local full="$1"
+  local keep_id="$2"
+  shift 2
+
+  local line rid val deleted=0
+  for line in "$@"; do
+    IFS=$'\t' read -r rid val <<<"$line"
+    [[ -n "$rid" ]] || continue
+    [[ "$rid" == "$keep_id" ]] && continue
+
+    if ali_delete_record "$rid"; then
+      deleted=$((deleted + 1))
+      log "Aliyun: deleted duplicate ${full} [${rid}] -> ${val}"
+    else
+      die "Aliyun duplicate cleanup failed for ${full}, recordId=${rid}"
+    fi
+  done
+
+  if (( deleted > 0 )); then
+    log "Aliyun: cleaned ${deleted} duplicate record(s) for ${full}"
+  fi
 }
 
 ali_upsert_record() {
   local current_ip="$1"
-  local body record_id remote_ip full rr_for_api update_body add_body
+  local body full rr_for_api update_body add_body keep_id="" keep_value=""
+  local -a record_lines=()
+  local line rid val
+
   body=$(ali_get_record) || die "Aliyun record query failed"
-  record_id=$(json_get 'DomainRecords.Record[0].RecordId' <<<"$body" 2>/dev/null || true)
-  remote_ip=$(json_get 'DomainRecords.Record[0].Value' <<<"$body" 2>/dev/null || true)
+  mapfile -t record_lines < <(ali_exact_records_tsv "$body")
+
   full=$(full_record_name)
   rr_for_api="$RR"
 
-  if [[ -n "$record_id" && "$record_id" != "null" ]]; then
-    if [[ "$remote_ip" == "$current_ip" ]]; then
-      log "Aliyun: no change, ${full} already -> ${current_ip}"
-      return 0
-    fi
-    update_body=$(ali_api "Action=UpdateDomainRecord
-RecordId=${record_id}
-RR=${rr_for_api}
-Type=${RECORD_TYPE}
-Value=${current_ip}
-TTL=${TTL}") || die "Aliyun update request failed"
-    if grep -q '"RecordId"' <<<"$update_body"; then
-      log "Aliyun: updated ${full} -> ${current_ip}"
-    else
-      die "Aliyun update failed: $update_body"
-    fi
-  else
+  if (( ${#record_lines[@]} == 0 )); then
     add_body=$(ali_api "Action=AddDomainRecord
 DomainName=${ZONE}
 RR=${rr_for_api}
 Type=${RECORD_TYPE}
 Value=${current_ip}
 TTL=${TTL}") || die "Aliyun create request failed"
+
     if grep -q '"RecordId"' <<<"$add_body"; then
       log "Aliyun: created ${full} -> ${current_ip}"
-    else
-      die "Aliyun create failed: $add_body"
+      return 0
     fi
+    die "Aliyun create failed: $add_body"
   fi
+
+  for line in "${record_lines[@]}"; do
+    IFS=$'\t' read -r rid val <<<"$line"
+    if [[ "$val" == "$current_ip" ]]; then
+      keep_id="$rid"
+      keep_value="$val"
+      break
+    fi
+  done
+
+  if [[ -n "$keep_id" ]]; then
+    log "Aliyun: no change, ${full} already -> ${current_ip}"
+    ali_cleanup_duplicate_lines "$full" "$keep_id" "${record_lines[@]}"
+    return 0
+  fi
+
+  IFS=$'\t' read -r keep_id keep_value <<<"${record_lines[0]}"
+  [[ -n "$keep_id" ]] || die "Aliyun matched record is missing RecordId"
+
+  update_body=$(ali_api "Action=UpdateDomainRecord
+RecordId=${keep_id}
+RR=${rr_for_api}
+Type=${RECORD_TYPE}
+Value=${current_ip}
+TTL=${TTL}") || die "Aliyun update request failed"
+
+  if grep -q '"RecordId"' <<<"$update_body"; then
+    log "Aliyun: updated ${full} ${keep_value} -> ${current_ip}"
+    ali_cleanup_duplicate_lines "$full" "$keep_id" "${record_lines[@]}"
+    return 0
+  fi
+
+  die "Aliyun update failed: $update_body"
 }
 
 run_once() {
