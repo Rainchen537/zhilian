@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME=$(basename "$0")
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 PROVIDER=""
 ZONE=""
@@ -183,21 +183,40 @@ PY
 
 get_default_ip_sources() {
   if [[ "$RECORD_TYPE" == "AAAA" ]]; then
-    printf '%s\n' \
-      "https://api6.ipify.org" \
-      "https://ipv6.icanhazip.com"
+    printf '%s
+'       "https://ifconfig.me/ip"       "https://api6.ipify.org"       "https://ipv6.icanhazip.com"
   else
-    printf '%s\n' \
-      "https://api.ipify.org" \
-      "https://ipv4.icanhazip.com" \
-      "https://ifconfig.me/ip"
+    printf '%s
+'       "https://ifconfig.me/ip"       "https://api.ipify.org"       "https://ipv4.icanhazip.com"
   fi
 }
 
 detect_public_ip() {
   local src ip
+
+  if [[ "$RECORD_TYPE" == "A" ]]; then
+    debug "Trying IP source: curl -4 ifconfig.me"
+    if ip=$(curl -4 -fsS --max-time 10 ifconfig.me 2>/dev/null | tr -d '[:space:]'); then
+      if validate_ip "$ip" "$RECORD_TYPE"; then
+        printf '%s
+' "$ip"
+        return 0
+      fi
+    fi
+  elif [[ "$RECORD_TYPE" == "AAAA" ]]; then
+    debug "Trying IP source: curl -6 ifconfig.me"
+    if ip=$(curl -6 -fsS --max-time 10 ifconfig.me 2>/dev/null | tr -d '[:space:]'); then
+      if validate_ip "$ip" "$RECORD_TYPE"; then
+        printf '%s
+' "$ip"
+        return 0
+      fi
+    fi
+  fi
+
   if [[ -n "$IP_SOURCES" ]]; then
-    tr ',' '\n' <<<"$IP_SOURCES"
+    tr ',' '
+' <<<"$IP_SOURCES"
   else
     get_default_ip_sources
   fi | while IFS= read -r src; do
@@ -205,7 +224,8 @@ detect_public_ip() {
     debug "Trying IP source: $src"
     if ip=$(curl -fsS --max-time 10 "$src" 2>/dev/null | tr -d '[:space:]'); then
       if validate_ip "$ip" "$RECORD_TYPE"; then
-        printf '%s\n' "$ip"
+        printf '%s
+' "$ip"
         return 0
       fi
     fi
