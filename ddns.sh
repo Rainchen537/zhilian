@@ -491,10 +491,14 @@ EOF2
 
 ali_build_query() {
   local extra="$1"
+  local line key value
   {
     ali_common_params
     printf '%s\n' "$extra"
-  } | while IFS= read -r key value; do
+  } | while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    key=${line%%=*}
+    value=${line#*=}
     [[ -n "$key" ]] || continue
     printf '%s=%s\n' "$(ali_percent_encode "$key")" "$(ali_percent_encode "$value")"
   done | LC_ALL=C sort | paste -sd'&' -
