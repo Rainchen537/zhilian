@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME=$(basename "$0")
-VERSION="0.1.1"
+VERSION="0.1.2"
 
 PROVIDER=""
 ZONE=""
@@ -255,6 +255,9 @@ require_args() {
       has_cmd openssl || die "Aliyun mode requires openssl"
       [[ -n "$ALI_ACCESS_KEY_ID" ]] || die "Aliyun requires ALI_ACCESS_KEY_ID or --ali-ak"
       [[ -n "$ALI_ACCESS_KEY_SECRET" ]] || die "Aliyun requires ALI_ACCESS_KEY_SECRET or --ali-sk"
+      if [[ "$TTL" =~ ^[0-9]+$ ]] && (( TTL < 600 )); then
+        log "WARN: Aliyun commonly requires TTL >= 600 on many editions; current TTL=${TTL} may fail on create/update"
+      fi
       ;;
     *) die "Unsupported provider: $PROVIDER" ;;
   esac
@@ -400,13 +403,33 @@ ali_build_query() {
 
 ali_api() {
   local extra="$1"
-  local canonical signature final_query url
+  local canonical signature final_query url resp body status
   canonical=$(ali_build_query "$extra")
   signature=$(ali_sign_query "$canonical")
   final_query="${canonical}&Signature=$(ali_percent_encode "$signature")"
   url="https://alidns.aliyuncs.com/?${final_query}"
   debug "Aliyun URL: $url"
-  curl -fsS "$url"
+
+  resp=$(curl -sS -w $'
+__HTTP_STATUS__:%{http_code}' "$url") || {
+    log "Aliyun request transport error"
+    return 1
+  }
+  status="${resp##*__HTTP_STATUS__:}"
+  body="${resp%$'
+'__HTTP_STATUS__:*}"
+
+  if [[ ! "$status" =~ ^[0-9]+$ ]]; then
+    log "Aliyun response parse error"
+    return 1
+  fi
+
+  if (( status < 200 || status >= 300 )); then
+    log "Aliyun HTTP ${status}: ${body}"
+    return 22
+  fi
+
+  printf '%s' "$body"
 }
 
 ali_get_record() {
