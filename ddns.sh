@@ -404,13 +404,20 @@ EOF2
 
 ali_build_query() {
   local extra="$1"
+  local line key value
   {
     ali_common_params
-    printf '%s\n' "$extra"
-  } | awk -F= 'NF>=2 {key=$1; $1=""; sub(/^=/, "", $0); print key "=" $0}' | LC_ALL=C sort | while IFS='=' read -r key value; do
-    printf '%s=%s\n' "$(ali_percent_encode "$key")" "$(ali_percent_encode "$value")"
-  done | paste -sd'&' -
+    printf '%s
+' "$extra"
+  } | while IFS= read -r line; do
+    [[ -n "$line" && "$line" == *=* ]] || continue
+    key=${line%%=*}
+    value=${line#*=}
+    printf '%s=%s
+' "$(ali_percent_encode "$key")" "$(ali_percent_encode "$value")"
+  done | LC_ALL=C sort | paste -sd'&' -
 }
+
 
 ali_api() {
   local extra="$1"
