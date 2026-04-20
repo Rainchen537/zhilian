@@ -9,7 +9,7 @@ ZONE=""
 RR=""
 INTERVAL="300"
 RECORD_TYPE="A"
-TTL="120"
+TTL=""
 PROXIED="false"
 ONCE="false"
 IP_SOURCES=""
@@ -34,7 +34,7 @@ Required:
 
 Optional:
   --type        Record type: A | AAAA (default: A)
-  --ttl         TTL in seconds (default: 120 for CF, 120 passed to APIs; Aliyun default may vary by plan)
+  --ttl         TTL in seconds (default: 120 for Cloudflare, 600 for Aliyun)
   --proxied     Cloudflare only: true | false (default: false)
   --once        Run once and exit
   --ip-sources  Comma-separated custom IP endpoints
@@ -53,7 +53,7 @@ USAGE
 }
 
 log() {
-  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >&2
 }
 
 debug() {
@@ -193,6 +193,7 @@ get_default_ip_sources() {
 
 detect_public_ip() {
   local src ip
+  local -a sources=()
 
   if [[ "$RECORD_TYPE" == "A" ]]; then
     debug "Trying IP source: curl -4 ifconfig.me"
@@ -215,11 +216,13 @@ detect_public_ip() {
   fi
 
   if [[ -n "$IP_SOURCES" ]]; then
-    tr ',' '
-' <<<"$IP_SOURCES"
+    mapfile -t sources < <(tr ',' '
+' <<<"$IP_SOURCES")
   else
-    get_default_ip_sources
-  fi | while IFS= read -r src; do
+    mapfile -t sources < <(get_default_ip_sources)
+  fi
+
+  for src in "${sources[@]}"; do
     [[ -n "$src" ]] || continue
     debug "Trying IP source: $src"
     if ip=$(curl -fsS --max-time 10 "$src" 2>/dev/null | tr -d '[:space:]'); then
@@ -243,8 +246,16 @@ require_args() {
   [[ -n "$ZONE" ]] || die "--zone is required"
   [[ -n "$RR" ]] || die "--rr is required"
   [[ "$INTERVAL" =~ ^[0-9]+$ ]] || die "--interval must be an integer"
-  [[ "$TTL" =~ ^[0-9]+$ ]] || die "--ttl must be an integer"
   [[ "$RECORD_TYPE" == "A" || "$RECORD_TYPE" == "AAAA" ]] || die "--type must be A or AAAA"
+
+  if [[ -z "$TTL" ]]; then
+    case "$PROVIDER" in
+      cloudflare) TTL="120" ;;
+      aliyun) TTL="600" ;;
+    esac
+  fi
+  [[ "$TTL" =~ ^[0-9]+$ ]] || die "--ttl must be an integer"
+
   case "$PROVIDER" in
     cloudflare)
       if [[ -z "$CF_API_TOKEN" && ( -z "$CF_API_KEY" || -z "$CF_API_EMAIL" ) ]]; then
