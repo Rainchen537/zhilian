@@ -2,10 +2,11 @@
 set -Eeuo pipefail
 
 PANEL_URL="https://polaris.bnbu.me"
-IMAGE="${XBOARD_IMAGE:-ghcr.io/cedar2025/xboard-node:latest}"
+POLARIS_IMAGE="ghcr.io/rainchen537/xboard-node@sha256:ae789704e2f6e90e812e926a37e83a5e3e8cdce4dbdd93b8b72414f0defac6ad"
+IMAGE="${XBOARD_IMAGE:-$POLARIS_IMAGE}"
 CONTAINER_NAME="${XBOARD_CONTAINER_NAME:-xboard-node}"
 DATA_DIR="${XBOARD_DATA_DIR:-/root/xboard-node/config}"
-KERNEL="singbox"
+KERNEL="xray"
 TOKEN="${POLARIS_TOKEN:-}"
 NODES_SPEC=""
 
@@ -30,10 +31,10 @@ Polaris Xboard-Node Docker 一键部署脚本
 参数：
   --token TOKEN       Polaris 面板 Server Token / API Key
   --nodes SPEC        节点 ID。支持 1-33、1,3,5、1-5,9,20-30
-  --kernel TYPE       singbox 或 xray，默认 singbox
+  --kernel TYPE       xray（默认，支持Proxy Protocol）或singbox（回退）
   --data-dir PATH     持久化目录，默认 /root/xboard-node/config
   --name NAME         Docker 容器名，默认 xboard-node
-  --image IMAGE       Docker 镜像，默认 ghcr.io/cedar2025/xboard-node:latest
+  --image IMAGE       Docker 镜像，默认使用Polaris公开fork的固定多架构digest
   -h, --help          显示帮助
 
 也可以通过环境变量传 token：
@@ -86,6 +87,12 @@ done
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行，例如：sudo bash ..."
 [[ "$KERNEL" == "singbox" || "$KERNEL" == "xray" ]] || die "--kernel 只能是 singbox 或 xray"
 [[ -n "$NODES_SPEC" ]] || die "必须指定 --nodes，例如 --nodes '1-33'"
+PROXY_PROTOCOL_READY=0
+if [[ "$KERNEL" == "xray" && "$IMAGE" == "$POLARIS_IMAGE" ]]; then
+  PROXY_PROTOCOL_READY=1
+else
+  warn "当前内核或镜像不是Polaris固定Xray组合，不声明Proxy Protocol就绪。"
+fi
 
 # curl | bash 时 stdin 已被脚本占用，因此从 /dev/tty 安全读取 token。
 if [[ -z "$TOKEN" ]]; then
@@ -180,16 +187,29 @@ mkdir -p "$DATA_DIR" "$BACKUP_DIR"
 chmod 700 "$DATA_DIR" || true
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
+RUN_BACKUP_DIR="$BACKUP_DIR/deploy-$STAMP"
+umask 077
+install -d -m 0700 "$RUN_BACKUP_DIR"
+OLD_CONFIG_EXISTED=0
+OLD_ENV_EXISTED=0
+HAD_OLD_CONTAINER=0
+OLD_IMAGE_ID=""
 if [[ -f "$CONFIG_FILE" ]]; then
-  cp -a "$CONFIG_FILE" "$BACKUP_DIR/config.yml.$STAMP"
-  log "已备份旧配置：$BACKUP_DIR/config.yml.$STAMP"
+  cp -a "$CONFIG_FILE" "$RUN_BACKUP_DIR/config.yml"
+  OLD_CONFIG_EXISTED=1
+  log "已备份旧配置：$RUN_BACKUP_DIR/config.yml"
 fi
 if [[ -f "$ENV_FILE" ]]; then
-  cp -a "$ENV_FILE" "$BACKUP_DIR/credentials.env.$STAMP"
+  cp -a "$ENV_FILE" "$RUN_BACKUP_DIR/credentials.env"
+  OLD_ENV_EXISTED=1
 fi
 if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
-  docker inspect "$CONTAINER_NAME" > "$BACKUP_DIR/container-inspect.$STAMP.json" || true
+  HAD_OLD_CONTAINER=1
+  OLD_IMAGE_ID="$(docker inspect "$CONTAINER_NAME" --format '{{.Image}}')"
+  docker inspect "$CONTAINER_NAME" > "$RUN_BACKUP_DIR/container-inspect.json"
+  docker logs --tail 200 "$CONTAINER_NAME" > "$RUN_BACKUP_DIR/container-before.log" 2>&1 || true
 fi
+chmod -R go-rwx "$RUN_BACKUP_DIR"
 
 TMP_CONFIG="$(mktemp "$DATA_DIR/.config.yml.XXXXXX")"
 TMP_ENV="$(mktemp "$DATA_DIR/.credentials.env.XXXXXX")"
@@ -222,13 +242,58 @@ done
 printf 'POLARIS_PANEL_TOKEN=%s\n' "$TOKEN" > "$TMP_ENV"
 chmod 600 "$TMP_CONFIG" "$TMP_ENV"
 
-log "拉取最新镜像：$IMAGE"
+log "拉取固定镜像：$IMAGE"
 docker pull "$IMAGE"
+TARGET_IMAGE_ID="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
+[[ -n "$TARGET_IMAGE_ID" ]] || die "拉取后无法读取目标镜像ID"
+
+DEPLOYMENT_STARTED=0
+rollback_deployment() {
+  local status="${1:-1}"
+  trap - ERR INT TERM
+  set +e
+  if (( DEPLOYMENT_STARTED )); then
+    warn "部署失败，开始恢复部署前状态。"
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+    if (( OLD_CONFIG_EXISTED )); then
+      cp -a "$RUN_BACKUP_DIR/config.yml" "$CONFIG_FILE.polaris-rollback"
+      mv -f "$CONFIG_FILE.polaris-rollback" "$CONFIG_FILE"
+    else
+      rm -f "$CONFIG_FILE"
+    fi
+    if (( OLD_ENV_EXISTED )); then
+      cp -a "$RUN_BACKUP_DIR/credentials.env" "$ENV_FILE.polaris-rollback"
+      mv -f "$ENV_FILE.polaris-rollback" "$ENV_FILE"
+    else
+      rm -f "$ENV_FILE"
+    fi
+    if (( HAD_OLD_CONTAINER )) && [[ -n "$OLD_IMAGE_ID" ]]; then
+      chmod 600 "$CONFIG_FILE" "$ENV_FILE"
+      docker run -d \
+        --name "$CONTAINER_NAME" \
+        --restart=unless-stopped \
+        --network=host \
+        --env-file "$ENV_FILE" \
+        -v "$DATA_DIR:/etc/xboard-node" \
+        "$OLD_IMAGE_ID" >/dev/null
+      sleep 5
+      docker inspect "$CONTAINER_NAME" \
+        --format 'rollback_status={{.State.Status}} restart_count={{.RestartCount}}' >&2
+    fi
+    warn "恢复流程已执行，备份：$RUN_BACKUP_DIR"
+  fi
+  exit "$status"
+}
+trap 'rollback_deployment $?' ERR
+trap 'rollback_deployment 130' INT TERM
 
 if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
   log "停止并移除旧容器：$CONTAINER_NAME"
+  DEPLOYMENT_STARTED=1
   docker stop "$CONTAINER_NAME" >/dev/null
   docker rm "$CONTAINER_NAME" >/dev/null
+else
+  DEPLOYMENT_STARTED=1
 fi
 
 # 原子替换配置，避免运行中的 watcher 读到写了一半的 YAML。
@@ -247,16 +312,35 @@ docker run -d \
   -v "$DATA_DIR:/etc/xboard-node" \
   "$IMAGE" >/dev/null
 
-sleep 5
-
-STATUS="$(docker inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || true)"
-RESTARTS="$(docker inspect "$CONTAINER_NAME" --format '{{.RestartCount}}' 2>/dev/null || echo 0)"
-
-if [[ "$STATUS" != "running" ]]; then
-  warn "容器未处于 running 状态（status=$STATUS）。最近日志："
+HEALTHY=0
+for _ in $(seq 1 20); do
+  STATUS="$(docker inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null || true)"
+  RESTARTS="$(docker inspect "$CONTAINER_NAME" --format '{{.RestartCount}}' 2>/dev/null || echo 999)"
+  if [[ "$STATUS" == "running" && "$RESTARTS" == "0" ]]; then
+    if [[ "$KERNEL" != "xray" ]] || docker logs "$CONTAINER_NAME" 2>&1 | grep -Fq 'xray started'; then
+      HEALTHY=1
+      break
+    fi
+  fi
+  sleep 2
+done
+if (( HEALTHY != 1 )); then
+  warn "容器未在时限内进入目标内核健康状态。最近日志："
   docker logs --tail 120 "$CONTAINER_NAME" 2>&1 || true
-  die "Xboard-Node 启动失败。旧配置备份位于 $BACKUP_DIR"
+  false
 fi
+if docker logs "$CONTAINER_NAME" 2>&1 | \
+  grep -Eiq 'invalid token|token invalid|handshake[^[:cntrl:]]*(401|403|422)|panic|fatal'; then
+  warn "日志出现Token、握手或致命错误。"
+  false
+fi
+RUNNING_IMAGE_ID="$(docker inspect "$CONTAINER_NAME" --format '{{.Image}}')"
+if [[ "$RUNNING_IMAGE_ID" != "$TARGET_IMAGE_ID" ]]; then
+  warn "运行容器镜像ID与拉取目标不一致。"
+  false
+fi
+trap - ERR INT TERM
+DEPLOYMENT_STARTED=0
 
 log "部署完成"
 printf '\n'
@@ -268,6 +352,12 @@ printf 'Credential: %s (mode 600)\n' "$ENV_FILE"
 printf 'Kernel:     %s\n' "$KERNEL"
 printf 'Nodes (%d): %s\n' "${#NODE_IDS[@]}" "${NODE_IDS[*]}"
 printf 'Restarts:   %s\n' "$RESTARTS"
+printf 'Backup:     %s\n' "$RUN_BACKUP_DIR"
+if (( PROXY_PROTOCOL_READY )); then
+  printf 'Proxy PP:   ready（XBoard接收与Nyanpass发送仍默认关闭）\n'
+else
+  printf 'Proxy PP:   unavailable（内核或镜像不符合Polaris固定组合）\n'
+fi
 printf '\n'
 
 if [[ "$RESTARTS" =~ ^[0-9]+$ ]] && (( RESTARTS > 0 )); then
