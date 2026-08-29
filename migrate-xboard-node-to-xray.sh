@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 container_name="${XBOARD_CONTAINER_NAME:-xboard-node}"
 data_dir="${XBOARD_DATA_DIR:-/root/xboard-node/config}"
-target_image="${XBOARD_TARGET_IMAGE:-ghcr.io/cedar2025/xboard-node:v1.13}"
+target_image="${XBOARD_TARGET_IMAGE:-ghcr.io/rainchen537/xboard-node@sha256:ae789704e2f6e90e812e926a37e83a5e3e8cdce4dbdd93b8b72414f0defac6ad}"
 dry_run=0
 
 log() { printf '\033[1;32m[INFO]\033[0m %s\n' "$*"; }
@@ -23,7 +23,7 @@ usage() {
     '  --dry-run        只验证配置并展示迁移范围' \
     '  --container NAME 旧脚本创建的容器名，默认 xboard-node' \
     '  --data-dir PATH  旧脚本配置目录，默认 /root/xboard-node/config' \
-    '  --image IMAGE    固定目标镜像，默认 ghcr.io/cedar2025/xboard-node:v1.13' \
+    '  --image IMAGE    固定目标镜像，默认使用Polaris公开fork的已验证多架构digest' \
     '  -h, --help       显示帮助'
 }
 
